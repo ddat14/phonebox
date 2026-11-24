@@ -7,5 +7,23 @@
   "lhm_url": "http://127.0.0.1:8085/data.json",
   "gpu_luid": "",
   "cpu_name": "",
-  "gpu_name": ""
+  "gpu_name": "",
+  "allow_power": false,
+  "launchers": {
+    "chrome": {
+      "label": "Chrome",
+      "path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "args": []
+    },
+    "vscode": {
+      "label": "VS Code",
+      "path": "C:\\Users\\TEN_BAN\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+      "args": []
+    },
+    "steam": {
+      "label": "Steam",
+      "path": "C:\\Program Files (x86)\\Steam\\steam.exe",
+      "args": []
+    }
+  }
 }

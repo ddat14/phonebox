@@ -38,6 +38,8 @@ struct PressStyle: ButtonStyle {
 @MainActor
 struct ContentView: View {
     @StateObject private var client = PCClient()
+    @StateObject private var deck = DeckStore()
+    @AppStorage("mainTab") private var tabRaw = "deck"
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
     @State private var confirmLock = false
@@ -51,14 +53,19 @@ struct ContentView: View {
                 VStack(spacing: 14) {
                     header
                     banner
-                    if let s = client.status { dashboard(s) } else { placeholder }
-                    controls
+                    if tabRaw == "deck" {
+                        DeckView(client: client, store: deck)
+                    } else {
+                        if let s = client.status { dashboard(s) } else { placeholder }
+                        controls
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
             .scrollIndicators(.hidden)
         }
+        .safeAreaInset(edge: .bottom) { tabBar }
         .tint(.cyan)
         // Chỉ poll khi app đang hiển thị; tự huỷ khi xuống nền hoặc khi bấm Kết nối lại
         .task(id: LoopKey(active: scenePhase == .active, nonce: client.nonce)) {
@@ -72,6 +79,36 @@ struct ContentView: View {
             Button("Khoá PC", role: .destructive) { client.send("lock") }
             Button("Huỷ", role: .cancel) {}
         }
+    }
+
+    // MARK: Tab bar (Phím tắt / Giám sát)
+
+    private var tabBar: some View {
+        HStack(spacing: 8) {
+            tabButton("deck", "Phím tắt", "square.grid.3x3.fill")
+            tabButton("monitor", "Giám sát", "gauge.with.dots.needle.67percent")
+        }
+        .padding(6)
+        .background(Color.white.opacity(0.1), in: Capsule())
+        .padding(.horizontal, 40)
+        .padding(.bottom, 4)
+        .background(Color.black.opacity(0.85).blur(radius: 8))
+    }
+
+    private func tabButton(_ id: String, _ title: String, _ icon: String) -> some View {
+        let selected = tabRaw == id
+        return Button {
+            withAnimation(.easeOut(duration: 0.15)) { tabRaw = id }
+            UISelectionFeedbackGenerator().selectionChanged()
+        } label: {
+            Label(title, systemImage: icon)
+                .font(.footnote.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .background(selected ? Color.cyan.opacity(0.3) : Color.clear, in: Capsule())
+                .foregroundStyle(selected ? Color.cyan : Color.secondary)
+        }
+        .buttonStyle(PressStyle())
     }
 
     // MARK: Header / banner
@@ -90,7 +127,10 @@ struct ContentView: View {
         case .idle: return "Chưa cấu hình"
         case .connecting: return "Đang kết nối…"
         case .online:
-            if let up = client.status?.uptimeS { return "Trực tuyến · bật máy \(formatUptime(up))" }
+            if let up = client.status?.uptimeS {
+                let mic = client.status?.micMuted == true ? " · mic tắt" : ""
+                return "Trực tuyến · bật máy \(formatUptime(up))\(mic)"
+            }
             return "Trực tuyến"
         case .unauthorized: return "Sai token"
         case .failed: return "Mất kết nối"

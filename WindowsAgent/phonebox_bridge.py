@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PhoneBox LAN bridge 1.1 - Windows 10/11.
+"""PhoneBox LAN bridge 1.2 - Windows 10/11.
 
 Thay đổi chính so với bản starter:
   * Sampler chạy nền 1 lần/giây, request chỉ trả JSON đã dựng sẵn (gần như 0 CPU).
@@ -9,8 +9,18 @@ Thay đổi chính so với bản starter:
   * Âm lượng thật (pycaw, tuỳ chọn) + nhiệt độ/quạt/công suất qua LibreHardwareMonitor (tuỳ chọn).
   * Tốc độ mạng (MB/s) thay cho tổng byte từ lúc boot.
   * HTTP/1.1 keep-alive, không CORS, chỉ nhận IP mạng riêng, so sánh token an toàn.
+
+1.2 (giao thức ghép đôi KHÔNG đổi: IP + port + header X-PhoneBox-Token, /api/status, /api/action):
+  * hotkey: tổ hợp phím bất kỳ (ctrl+shift+esc, win+d, alt+tab, f13...) do điện thoại gửi lên.
+  * text: gõ đoạn chữ (hỗ trợ tiếng Việt có dấu, qua SendInput Unicode).
+  * macro: chuỗi bước phím / chữ / chờ / mở URL / mở launcher.
+  * open_url (chỉ http/https) và launch (chỉ ID khai trong config.json "launchers" - lệnh nằm trên PC).
+  * system: sleep, monitor_off, lock; shutdown/restart/logoff chỉ khi config "allow_power": true.
+  * mic_mute (pycaw) + trạng thái mic; status có thêm fg_app (tên tiến trình cửa sổ đang dùng).
+  * GET /api/launchers: danh sách launcher để điện thoại chọn.
 """
 import atexit
+import ctypes
 import hmac
 import ipaddress
 import json
@@ -22,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +58,8 @@ DEFAULTS = {
     "gpu_luid": "",
     "cpu_name": "",
     "gpu_name": "",
+    "allow_power": False,   # cho phép shutdown / restart / logoff từ điện thoại
+    "launchers": {},        # {"chrome": {"label": "Chrome", "path": "C:\\...\\chrome.exe", "args": []}}
 }
 
 # ----------------------------------------------------------------------------- config
@@ -70,17 +83,142 @@ def load_config():
     return cfg
 
 # ----------------------------------------------------------------------------- Windows helpers
-KEYS = {  # virtual-key codes
+KEYS = {  # virtual-key codes (giữ nguyên các action cũ)
     "play_pause": 0xB3, "next": 0xB0, "previous": 0xB1,
     "mute": 0xAD, "vol_down": 0xAE, "vol_up": 0xAF,
 }
 LAUNCH = {"calculator": ["calc.exe"], "notepad": ["notepad.exe"]}
 
+# --- bảng tên phím cho hotkey (danh sách trắng) ---
+MODS = {"ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B, "cmd": 0x5B, "super": 0x5B}
+NAMED = {
+    "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B, "tab": 0x09, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pgup": 0x21, "pagedown": 0x22, "pgdn": 0x22,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "printscreen": 0x2C, "prtsc": 0x2C, "pause": 0x13, "capslock": 0x14, "numlock": 0x90,
+    "scrolllock": 0x91, "menu": 0x5D, "apps": 0x5D,
+    "plus": 0xBB, "minus": 0xBD, "equals": 0xBB, "comma": 0xBC, "period": 0xBE, "dot": 0xBE,
+    "slash": 0xBF, "backslash": 0xDC, "semicolon": 0xBA, "quote": 0xDE, "backtick": 0xC0,
+    "lbracket": 0xDB, "rbracket": 0xDD,
+    "play_pause": 0xB3, "playpause": 0xB3, "next": 0xB0, "previous": 0xB1, "prev": 0xB1,
+    "media_stop": 0xB2, "stop": 0xB2, "mute": 0xAD, "vol_down": 0xAE, "vol_up": 0xAF,
+    "browser_back": 0xA6, "browser_forward": 0xA7, "browser_refresh": 0xA8, "browser_home": 0xAC,
+}
+for _i in range(1, 25):
+    NAMED[f"f{_i}"] = 0x6F + _i
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    NAMED[_c] = ord(_c.upper())
+for _d in "0123456789":
+    NAMED[_d] = ord(_d)
+for _n in range(10):
+    NAMED[f"num{_n}"] = 0x60 + _n
+EXTENDED = {0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x5B, 0x5D, 0x90}
+MAX_KEYS = 6
+MAX_TEXT = 500
+MAX_MACRO_STEPS = 40
+MAX_MACRO_MS = 20000
+
+
+def parse_keys(names):
+    """['ctrl','shift','esc'] -> [vk,...]; ném ValueError nếu có phím lạ."""
+    if isinstance(names, str):
+        names = names.split("+")
+    if not isinstance(names, (list, tuple)) or not 1 <= len(names) <= MAX_KEYS:
+        raise ValueError("keys")
+    out = []
+    for n in names:
+        k = str(n).strip().lower()
+        vk = MODS.get(k) or NAMED.get(k)
+        if vk is None:
+            raise ValueError(f"unknown key {k}")
+        out.append(vk)
+    return out
+
+
+def _kb(vk, up):
+    flags = (2 if up else 0) | (1 if vk in EXTENDED else 0)
+    ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+
 
 def press_key(vk):
-    user32 = __import__("ctypes").windll.user32  # AttributeError ngoài Windows
-    user32.keybd_event(vk, 0, 0, 0)
-    user32.keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP
+    _kb(vk, False)
+    _kb(vk, True)
+
+
+def press_combo(vks):
+    """Giữ các phím đầu (modifier), bấm phím cuối, rồi nhả ngược thứ tự."""
+    for vk in vks:
+        _kb(vk, False)
+        time.sleep(0.012)
+    for vk in reversed(vks):
+        _kb(vk, True)
+        time.sleep(0.012)
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):  # cần để sizeof(INPUT) đúng trên 64-bit
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
+
+
+def type_text(text):
+    """Gõ chuỗi Unicode (tiếng Việt có dấu OK). \n -> Enter."""
+    units = []
+    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+        if ch == "\n":
+            units.append(("vk", 0x0D))
+            continue
+        b = ch.encode("utf-16-le")
+        for i in range(0, len(b), 2):
+            units.append(("u", int.from_bytes(b[i:i + 2], "little")))
+    for kind, code in units:
+        evs = []
+        for up in (False, True):
+            ki = _KEYBDINPUT()
+            if kind == "vk":
+                ki.wVk, ki.dwFlags = code, (2 if up else 0)
+            else:
+                ki.wScan, ki.dwFlags = code, 4 | (2 if up else 0)  # KEYEVENTF_UNICODE
+            evs.append(_INPUT(1, _INPUTUNION(ki=ki)))
+        arr = (_INPUT * 2)(*evs)
+        ctypes.windll.user32.SendInput(2, arr, ctypes.sizeof(_INPUT))
+        time.sleep(0.004)
+
+
+def open_url(url):
+    p = urllib.parse.urlparse(str(url))
+    if p.scheme not in ("http", "https") or not p.netloc or len(url) > 2000:
+        raise ValueError("url")
+    os.startfile(url)  # Windows: mở bằng trình duyệt mặc định
+
+
+def foreground_app():
+    """Tên tiến trình của cửa sổ đang dùng (vd chrome.exe). Chỉ tên tiến trình, không lấy tiêu đề."""
+    if not IS_WIN:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return psutil.Process(pid.value).name().lower()
+    except Exception:
+        return None
 
 
 def ps_oneshot(command, timeout=15):
@@ -125,17 +263,35 @@ except Exception:
     HAVE_PYCAW = False
 
 
-def _endpoint():
+def _endpoint(mic=False):
     try:
         CoInitialize()
     except OSError:
         pass
-    dev = AudioUtilities.GetSpeakers()
+    dev = AudioUtilities.GetMicrophone() if mic else AudioUtilities.GetSpeakers()
     ev = getattr(dev, "EndpointVolume", None)  # pycaw mới
     if ev is not None:
         return ev
     iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)  # pycaw cũ
     return ctypes.cast(iface, ctypes.POINTER(IAudioEndpointVolume))
+
+
+def get_mic_muted():
+    if not HAVE_PYCAW:
+        return None
+    try:
+        return bool(_endpoint(mic=True).GetMute())
+    except Exception:
+        return None
+
+
+def toggle_mic():
+    try:
+        ev = _endpoint(mic=True)
+        ev.SetMute(0 if ev.GetMute() else 1, None)
+        return True
+    except Exception:
+        return False
 
 
 def get_volume():
@@ -304,6 +460,7 @@ class Sampler:
                 if now - ts > 6:
                     gpu_pct = vram = None
                 vol, muted = get_volume()
+                mic_muted = get_mic_muted()
 
                 data = {
                     "hostname": host,
@@ -327,6 +484,8 @@ class Sampler:
                     "net_down_mbs": round(down, 3),
                     "volume": vol,
                     "muted": muted,
+                    "mic_muted": mic_muted,
+                    "fg_app": foreground_app(),
                     "uptime_s": int(time.time() - psutil.boot_time()),
                 }
                 self.payload = json.dumps(data, separators=(",", ":")).encode()
@@ -336,10 +495,123 @@ class Sampler:
 
 
 # ----------------------------------------------------------------------------- actions
-def run_action(action, value):
+_macro_lock = threading.Lock()
+
+
+def _system(name, cfg):
+    power = {"shutdown": ["shutdown", "/s", "/t", "5"], "restart": ["shutdown", "/r", "/t", "5"],
+             "logoff": ["shutdown", "/l"]}
+    if name in power:
+        if not cfg.get("allow_power"):
+            return 403, {"error": "power_disabled"}
+        subprocess.Popen(power[name], creationflags=NO_WINDOW)
+        return 200, {"ok": True}
+    if name == "cancel_shutdown":
+        subprocess.Popen(["shutdown", "/a"], creationflags=NO_WINDOW)
+    elif name == "sleep":
+        ctypes.windll.powrprof.SetSuspendState(False, True, False)
+    elif name == "monitor_off":
+        ctypes.windll.user32.PostMessageW(0xFFFF, 0x0112, 0xF170, 2)
+    elif name == "lock":
+        ctypes.windll.user32.LockWorkStation()
+    elif name == "mic_mute":
+        if not HAVE_PYCAW:
+            return 501, {"error": "pycaw_not_installed"}
+        return (200, {"ok": True}) if toggle_mic() else (500, {"error": "mic_failed"})
+    else:
+        return 400, {"error": "action_not_allowed"}
+    return 200, {"ok": True}
+
+
+def _launch(lid, cfg):
+    item = (cfg.get("launchers") or {}).get(str(lid))
+    if not isinstance(item, dict) or not item.get("path"):
+        return 404, {"error": "launcher_not_found"}
+    args = [str(a) for a in (item.get("args") or [])]
+    subprocess.Popen([str(item["path"])] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     cwd=item.get("cwd") or None)
+    return 200, {"ok": True}
+
+
+def validate_macro(steps):
+    """Kiểm tra toàn bộ macro TRƯỚC khi chạy để không chạy dở chừng."""
+    if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_MACRO_STEPS:
+        raise ValueError("steps")
+    total, out = 0, []
+    for st in steps:
+        if not isinstance(st, dict):
+            raise ValueError("step")
+        if "keys" in st:
+            out.append(("keys", parse_keys(st["keys"])))
+        elif "text" in st:
+            if not isinstance(st["text"], str) or len(st["text"]) > MAX_TEXT:
+                raise ValueError("text")
+            out.append(("text", st["text"]))
+        elif "delay" in st:
+            ms = max(0, min(5000, int(st["delay"])))
+            total += ms
+            out.append(("delay", ms))
+        elif "url" in st:
+            p = urllib.parse.urlparse(str(st["url"]))
+            if p.scheme not in ("http", "https") or not p.netloc:
+                raise ValueError("url")
+            out.append(("url", str(st["url"])))
+        elif "launch" in st:
+            out.append(("launch", str(st["launch"])))
+        else:
+            raise ValueError("step")
+    if total > MAX_MACRO_MS:
+        raise ValueError("too_long")
+    return out
+
+
+def _run_macro(steps, cfg):
+    try:
+        for kind, arg in steps:
+            if kind == "keys":
+                press_combo(arg)
+                time.sleep(0.05)
+            elif kind == "text":
+                type_text(arg)
+            elif kind == "delay":
+                time.sleep(arg / 1000.0)
+            elif kind == "url":
+                open_url(arg)
+            elif kind == "launch":
+                _launch(arg, cfg)
+    except Exception as exc:
+        print("macro error:", exc)
+    finally:
+        _macro_lock.release()
+
+
+def run_action(payload, cfg):
+    action, value = payload.get("action"), payload.get("value")
     try:
         if action in KEYS:
             press_key(KEYS[action])
+            return 200, {"ok": True}
+        if action == "hotkey":
+            press_combo(parse_keys(payload.get("keys")))
+            return 200, {"ok": True}
+        if action == "text":
+            t = payload.get("text")
+            if not isinstance(t, str) or not t or len(t) > MAX_TEXT:
+                return 400, {"error": "bad_value"}
+            type_text(t)
+            return 200, {"ok": True}
+        if action == "open_url":
+            open_url(payload.get("url"))
+            return 200, {"ok": True}
+        if action == "launch":
+            return _launch(payload.get("id"), cfg)
+        if action == "system":
+            return _system(str(payload.get("name")), cfg)
+        if action == "macro":
+            steps = validate_macro(payload.get("steps"))
+            if not _macro_lock.acquire(blocking=False):
+                return 409, {"error": "macro_busy"}
+            threading.Thread(target=_run_macro, args=(steps, cfg), daemon=True).start()
             return 200, {"ok": True}
         if action == "set_volume":
             if not HAVE_PYCAW:
@@ -350,7 +622,7 @@ def run_action(action, value):
             subprocess.Popen(LAUNCH[action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return 200, {"ok": True}
         if action == "lock":
-            __import__("ctypes").windll.user32.LockWorkStation()
+            ctypes.windll.user32.LockWorkStation()
             return 200, {"ok": True}
     except (AttributeError, OSError):
         return 501, {"error": "windows_only"}
@@ -366,7 +638,7 @@ class Server(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive: iPhone không phải bắt tay TCP mỗi giây
-    server_version = "PhoneBoxLAN/1.1"
+    server_version = "PhoneBoxLAN/1.2"
     timeout = 15
     disable_nagle_algorithm = True  # tránh trễ ~40ms do Nagle + delayed-ACK
 
@@ -408,6 +680,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.server.sampler.ready.is_set():
                 return self._json(503, {"error": "warming_up"})
             return self._send(200, self.server.sampler.payload)
+        if self.path.split("?")[0] == "/api/launchers":
+            items = [{"id": k, "label": (v or {}).get("label") or k}
+                     for k, v in (self.server.cfg.get("launchers") or {}).items()]
+            return self._json(200, {"launchers": items, "allow_power": bool(self.server.cfg.get("allow_power"))})
         self._json(404, {"error": "not_found"})
 
     def do_POST(self):
@@ -417,10 +693,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not_found"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length > 1024:
+            if length > 16384:
                 return self._json(413, {"error": "too_large"})
             payload = json.loads(self.rfile.read(length) or b"{}")
-            code, obj = run_action(payload.get("action"), payload.get("value"))
+            if not isinstance(payload, dict):
+                return self._json(400, {"error": "bad_request"})
+            code, obj = run_action(payload, self.server.cfg)
             self._json(code, obj)
         except (ValueError, AttributeError):
             self._json(400, {"error": "bad_request"})
@@ -449,11 +727,13 @@ def main():
     server = Server((cfg["host"], int(cfg["port"])), Handler)
     server.token = cfg["token"]
     server.sampler = sampler
+    server.cfg = cfg
 
     print("\nPhoneBox LAN bridge đang chạy")
     print(f"CPU        : {sampler.cpu_name or '?'}")
     print(f"GPU        : {sampler.gpu_name or '?'}")
     print(f"Âm lượng   : {'pycaw OK' if HAVE_PYCAW else 'chỉ phím +/- (cài pycaw để có thanh trượt)'}")
+    print(f"Launcher   : {len(cfg.get('launchers') or {})} mục trong config.json | Nguồn điện: {'BẬT' if cfg.get('allow_power') else 'tắt (allow_power)'}")
     print(f"Nhiệt độ   : {'đọc từ LibreHardwareMonitor nếu đang chạy' if cfg.get('lhm_url') else 'tắt'}")
     print("\nĐịa chỉ IP (chọn cái cùng mạng Wi-Fi với iPhone):")
     for name, ip in lan_ips():

@@ -25,7 +25,18 @@ struct PCStatus: Decodable {
     var netDownMbs: Double
     var volume: Int?
     var muted: Bool?
+    var micMuted: Bool?
+    var fgApp: String?
     var uptimeS: Double?
+}
+
+struct LauncherInfo: Decodable, Identifiable, Hashable {
+    var id: String
+    var label: String
+}
+
+private struct LauncherList: Decodable {
+    var launchers: [LauncherInfo]
 }
 
 enum LinkState: Equatable {
@@ -46,6 +57,7 @@ final class PCClient: ObservableObject {
     @Published private(set) var gpuHistory: [Double] = []
     @Published private(set) var nonce = 0
     @Published var actionError: String?
+    @Published private(set) var launchers: [LauncherInfo] = []
 
     @Published var host: String { didSet { defaults.set(host, forKey: "host") } }
     @Published var port: String { didSet { defaults.set(port, forKey: "port") } }
@@ -198,9 +210,6 @@ final class PCClient: ObservableObject {
     // MARK: Actions
 
     func send(_ action: String, value: Int? = nil) {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        guard let u = url("/api/action") else { return }
-
         if action == "set_volume", let value {
             status?.volume = value
             holdLocalAudioUntil = Date().addingTimeInterval(1.5)
@@ -208,27 +217,54 @@ final class PCClient: ObservableObject {
             status?.muted = !(status?.muted ?? false)
             holdLocalAudioUntil = Date().addingTimeInterval(1.5)
         }
+        var body: [String: Any] = ["action": action]
+        if let value { body["value"] = value }
+        post(body)
+    }
 
+    /// Gửi một action tuỳ ý tới /api/action (cùng header token như cũ).
+    func post(_ body: [String: Any], haptic: Bool = true) {
+        if haptic { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        guard let u = url("/api/action") else { return }
         var req = authorized(u)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body: [String: Any] = ["action": action]
-        if let value { body["value"] = value }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         Task {
             do {
                 let (_, resp) = try await self.session.data(for: req)
                 if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                    self.showActionError(http.statusCode == 501
-                        ? "PC chưa hỗ trợ thao tác này (thiếu pycaw?)"
-                        : "Thao tác thất bại (HTTP \(http.statusCode))")
+                    self.showActionError(Self.actionMessage(http.statusCode))
                 }
             } catch {
                 self.showActionError(Self.describe(error))
             }
         }
     }
+
+    private static func actionMessage(_ code: Int) -> String {
+        switch code {
+        case 400: return "Bridge từ chối nút này (tên phím không hợp lệ hoặc thiếu nội dung)"
+        case 403: return "Thao tác bị tắt trên PC (ví dụ allow_power trong config.json)"
+        case 404: return "Launcher chưa khai báo trong config.json trên PC"
+        case 409: return "Macro trước vẫn đang chạy"
+        case 501: return "PC chưa hỗ trợ thao tác này (thiếu pycaw? bridge cũ?)"
+        default: return "Thao tác thất bại (HTTP \(code))"
+        }
+    }
+
+    /// Lấy danh sách launcher khai trong config.json của bridge (để chọn trong trình sửa nút).
+    func loadLaunchers() async {
+        guard let u = url("/api/launchers") else { return }
+        if let (data, resp) = try? await session.data(for: authorized(u)),
+           (resp as? HTTPURLResponse)?.statusCode == 200,
+           let list = try? decoder.decode(LauncherList.self, from: data) {
+            launchers = list.launchers
+        }
+    }
+
+    func reportLocalError(_ msg: String) { showActionError(msg) }
 
     private func showActionError(_ msg: String) {
         actionError = msg
