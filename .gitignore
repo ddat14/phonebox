@@ -1,0 +1,8 @@
+WindowsAgent/config.json
+WindowsAgent/gpu_probe.ps1
+__pycache__/
+*.xcodeproj
+Config/Info.plist
+build/
+Payload/
+*.ipa

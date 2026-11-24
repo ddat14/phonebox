@@ -1,0 +1,40 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (no code signing)
+        run: |
+          xcodebuild \
+            -project PhoneBoxIOS.xcodeproj \
+            -scheme PhoneBoxIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/PhoneBoxIOS.app Payload/
+          zip -qr PhoneBoxIOS.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneBoxIOS-unsigned-ipa
+          path: PhoneBoxIOS.ipa

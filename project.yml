@@ -1,0 +1,33 @@
+name: PhoneBoxIOS
+options:
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.1.0"
+    CURRENT_PROJECT_VERSION: "2"
+targets:
+  PhoneBoxIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phonebox.lan.companion
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: PhoneBox
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Cho phép HTTP tới PC trong mạng LAN (bridge chạy HTTP)
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Kết nối tới PC Windows trong mạng nhà để xem thông số và điều khiển.
+        # Cho phép animation 120Hz (ProMotion) trên iPhone 14 Pro
+        CADisableMinimumFrameDurationOnPhone: true

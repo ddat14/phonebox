@@ -1,0 +1,11 @@
+{
+  "host": "0.0.0.0",
+  "port": 8787,
+  "token": "REPLACE_WITH_A_LONG_RANDOM_TOKEN",
+  "vram_total_gb": 8,
+  "disk_path": "C:\\",
+  "lhm_url": "http://127.0.0.1:8085/data.json",
+  "gpu_luid": "",
+  "cpu_name": "",
+  "gpu_name": ""
+}
